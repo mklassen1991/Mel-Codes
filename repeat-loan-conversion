@@ -1,0 +1,231 @@
+WITH deal_transitions AS (
+    SELECT d.id AS deal_id,
+        d.dealname,
+        d.dealstage,
+        hs_is_closed_won,
+        DATE(TIMESTAMP_MILLIS(CAST(d.createdate AS INT64))) AS createdate,
+        max(d.associated_vids) AS associated_vids,
+        min(d.uuid_ts) AS first_seen,
+        max(d.purchase_price) AS purchase_price,
+        max(d.state) AS state
+    FROM hubspot.deals d
+    WHERE lower(d.dealname) NOT LIKE '%test%'
+    GROUP BY 1,
+        2,
+        3,
+        4,
+        5
+),
+current_record AS (
+    SELECT id,
+        max(uuid_ts) AS current_ts
+    FROM hubspot.contacts
+    GROUP BY 1
+),
+deal_data AS (
+    SELECT hd.deal_id,
+        hc.id AS contact_id,
+        hd.dealname,
+        hd.createdate,
+        max(hc.properties_credit_score_value) AS properties_credit_score_value,
+        max(hd.state) AS state,
+        max(hd.purchase_price) AS purchase_price,
+        min(hd.first_seen) AS first_seen,
+        concat(
+            extract(
+                year
+                FROM min(hd.first_seen)
+            ),
+            '-',
+            lpad(
+                cast(
+                    extract(
+                        week
+                        FROM min(hd.first_seen)
+                    ) AS STRING
+                ),
+                2,
+                '0'
+            )
+        ) AS cohort,
+        max(
+            CASE
+                WHEN dealstage = 'appointmentscheduled' THEN hd.first_seen
+                ELSE NULL
+            END
+        ) AS appointmentscheduled,
+        max(
+            CASE
+                WHEN dealstage IN (
+                    'appointmentscheduled',
+                    'qualifiedtobuy',
+                    'presentationscheduled',
+                    'closedwon',
+                    '21176680',
+                    '4447566',
+                    '4447567'
+                ) THEN 1
+                ELSE 0
+            END
+        ) AS appointmentscheduled_flag,
+        max(
+            CASE
+                WHEN dealstage = 'qualifiedtobuy' THEN hd.first_seen
+                ELSE NULL
+            END
+        ) AS loan_application,
+        max(
+            CASE
+                WHEN dealstage IN (
+                    'qualifiedtobuy',
+                    'presentationscheduled',
+                    'closedwon',
+                    '21176680',
+                    '4447566',
+                    '4447567'
+                ) THEN 1
+                ELSE 0
+            END
+        ) AS loan_application_flag,
+        max(
+            CASE
+                WHEN dealstage = 'presentationscheduled' THEN hd.first_seen
+                ELSE NULL
+            END
+        ) AS processing,
+        max(
+            CASE
+                WHEN dealstage IN (
+                    'presentationscheduled',
+                    'closedwon',
+                    '21176680',
+                    '4447566',
+                    '4447567'
+                ) THEN 1
+                ELSE 0
+            END
+        ) AS processing_flag,
+        max(
+            CASE
+                WHEN dealstage = 'closedwon' THEN hd.first_seen
+                ELSE NULL
+            END
+        ) AS post_funded,
+        max(
+            CASE
+                WHEN dealstage IN ('closedwon', '21176680', '4447566', '4447567') THEN 1
+                ELSE 0
+            END
+        ) AS post_funded_flag,
+        max(
+            CASE
+                WHEN dealstage = '21176680' THEN hd.first_seen
+                ELSE NULL
+            END
+        ) AS serviced,
+        max(
+            CASE
+                WHEN dealstage IN ('21176680', '4447566', '4447567') THEN 1
+                ELSE 0
+            END
+        ) AS serviced_flag,
+        max(
+            CASE
+                WHEN dealstage = '4447566' THEN hd.first_seen
+                ELSE NULL
+            END
+        ) AS sold,
+        max(
+            CASE
+                WHEN dealstage IN ('4447566', '4447567') THEN 1
+                ELSE 0
+            END
+        ) AS sold_flag,
+        max(
+            CASE
+                WHEN dealstage = '4447567' THEN hd.first_seen
+                ELSE NULL
+            END
+        ) AS repaid,
+        max(
+            CASE
+                WHEN dealstage IN ('4447567') THEN 1
+                ELSE 0
+            END
+        ) AS repaid_flag,
+        max(
+            CASE
+                WHEN dealstage = '2560164' THEN hd.first_seen
+                ELSE NULL
+            END
+        ) AS deal_lost,
+        max(
+            CASE
+                WHEN dealstage = '61079889' THEN hd.first_seen
+                ELSE NULL
+            END
+        ) AS loan_application_incomplete
+    FROM deal_transitions hd
+        JOIN hubspot.contacts_view hc ON hc.id IN UNNEST(SPLIT(hd.associated_vids, ','))
+    GROUP BY hd.deal_id,
+        hc.id,
+        hd.dealname,
+        createdate
+),
+loan_app_counts AS (
+    SELECT deal_id,
+        contact_id,
+        createdate,
+        COUNT(*) AS total_loan_apps,
+        ROW_NUMBER() OVER (
+            PARTITION BY contact_id
+            ORDER BY createdate
+        ) AS loan_app_rank,
+        ROW_NUMBER() OVER (
+            PARTITION BY contact_id
+            ORDER BY createdate
+        ) AS row_number
+    FROM deal_data
+    WHERE loan_application_flag = 1
+    GROUP BY deal_id,
+        contact_id,
+        createdate
+),
+closed_loans AS (
+    SELECT hd.id AS deal_id,
+        hc.id AS contact_id,
+        hd.hs_is_closed_won,
+        DATE(TIMESTAMP_MILLIS(CAST(hd.createdate AS INT64))) AS createdate,
+        DATE(TIMESTAMP_MILLIS(CAST(hd.closedate AS INT64))) AS closedate,
+        ROW_NUMBER() OVER (
+            PARTITION BY hc.id
+            ORDER BY closedate
+        ) AS closed_loan_rank
+    FROM hubspot.deals_view hd
+        JOIN hubspot.contacts_view hc ON hc.id IN UNNEST(SPLIT(hd.associated_vids, ','))
+    WHERE cast(hd.hs_is_closed_won AS BOOL) = TRUE
+        AND hd.dealname IS NOT NULL
+        AND hd.closedate IS NOT NULL
+        AND hd.dealstage <> '65967921'
+),
+repeat_loans AS (
+    SELECT deal_id,
+        createdate,
+        closedate,
+        contact_id,
+        ROW_NUMBER() OVER (
+            PARTITION BY contact_id
+            ORDER BY createdate
+        ) AS closed_loan_rank,
+        FROM closed_loans
+    WHERE contact_id IN (
+            SELECT contact_id
+            FROM closed_loans
+            GROUP BY contact_id
+            HAVING COUNT(*) > 1
+        )
+)
+SELECT rl.*,
+    total_loan_apps
+FROM repeat_loans rl
+    LEFT JOIN loan_app_counts lac ON rl.contact_id = lac.contact_id
