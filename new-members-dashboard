@@ -1,0 +1,208 @@
+--NEW MEMBER REGISTRATIONS
+WITH new_members AS (
+  SELECT ins.user_id,
+    COALESCE(hc.id, u.hubspot_id) AS id,
+    MIN(FORMAT_DATE('%Y-%m-%d', ins.user_created_at)) AS create_date,
+    MIN(timestamp) AS first_seen,
+    ins.utm_source,
+    ins.utm_content
+  FROM analytics.inbound_source ins
+    LEFT JOIN zion.user u ON u.id = ins.user_id
+    LEFT JOIN hubspot.contacts hc ON u.hubspot_id = hc.id
+  WHERE ins.utm_source IN (
+      'facebook',
+      'google',
+      'fbad',
+      'fblanding1',
+      'fblandingZG',
+      'fb',
+      'Prequal',
+      'Prequalfb'
+    )
+    AND ins.user_id IS NOT NULL
+    AND ins.user_created_at IS NOT NULL
+  GROUP BY ins.user_id,
+    id,
+    ins.utm_source,
+    ins.utm_content
+  ORDER BY create_date DESC
+),
+users_credit AS (
+  SELECT coalesce(hc.id, u.hubspot_id) AS id,
+    CASE
+      WHEN hc.properties_credit_score_value IS NOT NULL THEN hc.properties_credit_score_value
+      ELSE u.credit_score
+    END AS credit_score,
+    coalesce(hc.first_seen, u.first_seen) AS first_seen,
+    row_number() OVER (
+      PARTITION BY coalesce(hc.id, u.hubspot_id)
+      ORDER BY coalesce(hc.first_seen, u.first_seen)
+    ) AS rn
+  FROM (
+      SELECT id,
+        properties_credit_score_value,
+        min(uuid_ts) AS first_seen
+      FROM hubspot.contacts
+      WHERE properties_credit_score_value IS NOT NULL
+      GROUP BY 1,
+        2
+    ) AS hc
+    FULL OUTER JOIN (
+      SELECT u.id,
+        PARSE_TIMESTAMP('%Y-%m-%d %H:%M:%E*S+00', lp.created_at) AS first_seen,
+        u.hubspot_id,
+        u.email,
+        lp.credit_score
+      FROM zion.user u
+        JOIN zion.loan_profile lp ON u.loan_profile_id = lp.id
+      WHERE coalesce(lp.credit_score, '') != ''
+    ) AS u ON hc.id = u.hubspot_id
+  WHERE TRUE
+),
+cleaned_users_credit AS (
+  SELECT id,
+    first_seen,
+    CASE
+      WHEN credit_score = '600700' THEN 620
+      WHEN credit_score = '640-669' THEN 655
+      WHEN credit_score = '640-670' THEN 655
+      WHEN credit_score = '670-689' THEN 680
+      WHEN credit_score = '670-690' THEN 680
+      WHEN credit_score = '690+' THEN 720
+      WHEN credit_score = '690-749' THEN 720
+      WHEN credit_score = '750+' THEN 770
+      WHEN credit_score = 'Below 640+' THEN 620
+      WHEN credit_score = 'below-640' THEN 620
+      WHEN credit_score = 'Below 640' THEN 620
+      ELSE cast(credit_score AS int64)
+    END AS credit_score
+  FROM users_credit
+),
+new_members_credit AS (
+  SELECT DISTINCT nm.user_id,
+    nm.id,
+    nm.create_date,
+    nm.utm_source,
+    nm.utm_content,
+    uc.credit_score
+  FROM new_members nm
+    LEFT JOIN cleaned_users_credit uc ON nm.id = uc.id
+  ORDER BY nm.create_date DESC
+),
+flippers AS (
+  SELECT DISTINCT u.id AS user_id
+  FROM zion.user u
+    LEFT JOIN zion.loan_application la ON la.user_id = u.id
+    LEFT JOIN zion.loan_profile lp ON u.loan_profile_id = lp.id
+    LEFT JOIN hubspot.contacts c ON u.hubspot_id = c.id
+  WHERE la.flips_completed > 0
+    OR lp.properties_flipped IN ('1-2', '1', '10+', '2-4', '5-9', '3-9')
+    OR c.properties_flip_value IN (
+      '1',
+      '10',
+      '10+',
+      '2',
+      '3',
+      '4',
+      '5',
+      '6',
+      '7',
+      '8',
+      '9'
+    )
+),
+--TOTAL APPLICATIONS:
+total_apps AS (
+  SELECT hd.id AS deal_id,
+    hd.hs_is_closed_won,
+    DATE(TIMESTAMP_MILLIS(CAST(hd.createdate AS INT64))) AS createdate,
+    DATE(TIMESTAMP_MILLIS(CAST(hd.closedate AS INT64))) AS closedate,
+    hd.associated_vids,
+    hd.loan_status,
+    hd.dealstage,
+    hd.deal_tier,
+    hc.id
+  FROM hubspot.deals_view hd
+    JOIN hubspot.contacts_view hc ON hc.id IN UNNEST(SPLIT(hd.associated_vids, ','))
+  WHERE dealstage NOT IN (
+      'appointmentscheduled',
+      '61079889',
+      '65967921',
+      '2560164'
+    )
+    AND hd.dealname IS NOT NULL
+),
+--NEW MEMBER APPLICATIONS:
+new_member_apps AS (
+  SELECT nmc.user_id,
+    nmc.id,
+    nmc.create_date,
+    nmc.credit_score,
+    nmc.utm_source,
+    nmc.utm_content,
+    ta.deal_id,
+    ta.createdate,
+    ta.closedate,
+    ta.associated_vids,
+    ta.loan_status,
+    ta.dealstage,
+    ta.deal_tier,
+    FROM new_members_credit nmc
+    LEFT JOIN total_apps ta ON nmc.id = ta.id
+  WHERE ta.dealstage IS NOT NULL
+  ORDER BY create_date DESC
+)
+SELECT nmc.create_date,
+  nmc.utm_source,
+  nmc.utm_content,
+  COUNT(DISTINCT nmc.user_id) AS total_new_members,
+  COUNT(DISTINCT f.user_id) AS new_member_flippers,
+  COUNT(
+    DISTINCT CASE
+      WHEN nmc.credit_score >= 640 THEN nmc.user_id
+    END
+  ) AS credit_640_new_members,
+  COUNT(DISTINCT nma.deal_id) AS total_applications,
+  COUNT(
+    DISTINCT CASE
+      WHEN nma.deal_tier IN (
+        'Tier 1 - Great Deal',
+        'Tier 2 - Good Deal',
+        'Tier 3 - OK Deal'
+      ) THEN nma.deal_id
+    END
+  ) AS tier_1_3_new_apps,
+  COUNT(
+    DISTINCT CASE
+      WHEN nma.deal_tier = 'Tier 1 - Great Deal' THEN nma.deal_id
+    END
+  ) AS sum_tier_1,
+  COUNT(
+    DISTINCT CASE
+      WHEN nma.deal_tier = 'Tier 2 - Good Deal' THEN nma.deal_id
+    END
+  ) AS sum_tier_2,
+  COUNT(
+    DISTINCT CASE
+      WHEN nma.deal_tier = 'Tier 3 - OK Deal' THEN nma.deal_id
+    END
+  ) AS sum_tier_3,
+  COUNT(
+    DISTINCT CASE
+      WHEN nma.credit_score >= 640 THEN nma.deal_id
+    END
+  ) AS credit_640_applications,
+  COUNT(
+    DISTINCT CASE
+      WHEN f.user_id IS NOT NULL THEN nma.deal_id
+    END
+  ) AS total_apps_flipper
+FROM new_members_credit nmc
+  LEFT JOIN new_member_apps nma ON nmc.id = nma.id
+  LEFT JOIN flippers f ON f.user_id = nmc.user_id
+WHERE nmc.create_date BETWEEN @create_date AND @create_date_end
+GROUP BY nmc.create_date,
+  utm_source,
+  utm_content
+ORDER BY nmc.create_date DESC,
+  total_new_members DESC
