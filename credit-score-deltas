@@ -1,0 +1,163 @@
+WITH closed_loans AS (
+  SELECT DISTINCT hd.id AS deal_id,
+    COALESCE(hc.id, u.hubspot_id) AS id,
+    DATE(TIMESTAMP_MILLIS(CAST(hd.createdate AS INT64))) AS createdate,
+    DATE(TIMESTAMP_MILLIS(CAST(hd.closedate AS INT64))) AS closedate,
+    properties_credit_score_value,
+    hd.deal_fico
+  FROM hubspot.deals_view hd
+    JOIN hubspot.contacts_view hc ON hc.id IN UNNEST(SPLIT(hd.associated_vids, ','))
+    LEFT JOIN zion.user u ON u.hubspot_id = hc.id
+  WHERE cast(hd.hs_is_closed_won AS BOOL) = TRUE
+    AND hd.dealname IS NOT NULL
+    AND hd.closedate IS NOT NULL
+    AND hd.dealstage <> '65967921'
+),
+users_credit AS (
+  SELECT coalesce(hc.id, u.hubspot_id) AS id,
+    CASE
+      WHEN hc.properties_credit_score_value IS NOT NULL THEN hc.properties_credit_score_value
+      ELSE u.credit_score
+    END AS credit_score,
+    coalesce(hc.first_seen, u.first_seen) AS first_seen,
+    row_number() OVER (
+      PARTITION BY coalesce(hc.id, u.hubspot_id)
+      ORDER BY coalesce(hc.first_seen, u.first_seen)
+    ) AS rn
+  FROM (
+      SELECT id,
+        properties_credit_score_value,
+        min(uuid_ts) AS first_seen
+      FROM hubspot.contacts
+      WHERE properties_credit_score_value IS NOT NULL
+      GROUP BY 1,
+        2
+    ) AS hc
+    FULL OUTER JOIN (
+      SELECT u.id,
+        PARSE_TIMESTAMP('%Y-%m-%d %H:%M:%E*S+00', lp.created_at) AS first_seen,
+        u.hubspot_id,
+        u.email,
+        lp.credit_score
+      FROM zion.user u
+        JOIN zion.loan_profile lp ON u.loan_profile_id = lp.id
+      WHERE coalesce(lp.credit_score, '') != ''
+    ) AS u ON hc.id = u.hubspot_id
+  WHERE TRUE
+),
+cleaned_users_credit AS (
+  SELECT id,
+    first_seen,
+    credit_score AS raw_credit,
+    CASE
+      WHEN credit_score = '600700' THEN 620
+      WHEN credit_score = '640-669' THEN 655
+      WHEN credit_score = '640-670' THEN 655
+      WHEN credit_score = '670-689' THEN 680
+      WHEN credit_score = '670-690' THEN 680
+      WHEN credit_score = '690+' THEN 720
+      WHEN credit_score = '690-749' THEN 720
+      WHEN credit_score = '750+' THEN 770
+      WHEN credit_score = 'Below 640+' THEN 620
+      WHEN credit_score = 'below-640' THEN 620
+      WHEN credit_score = 'Below 640' THEN 620
+      ELSE cast(credit_score AS int64)
+    END AS credit_score
+  FROM users_credit
+),
+joined_data AS (
+  SELECT uc.raw_credit,
+    uc.credit_score AS self_reported_credit_score,
+    cl.deal_fico AS actual_credit_score,
+    CASE
+      WHEN uc.credit_score < 640 THEN '000-639'
+      WHEN uc.credit_score BETWEEN 640 AND 669 THEN '640-669'
+      WHEN uc.credit_score BETWEEN 670 AND 689 THEN '670-689'
+      WHEN uc.credit_score BETWEEN 690 AND 720 THEN '690-720'
+      WHEN uc.credit_score > 720 THEN '721-800'
+      ELSE 'Unknown'
+    END AS self_reported_range
+  FROM cleaned_users_credit uc
+    JOIN closed_loans cl ON uc.id = cl.id --inner join to compare ids where a self-reported credit score is present
+),
+score_accuracy AS (
+  SELECT raw_credit,
+    self_reported_credit_score,
+    actual_credit_score,
+    self_reported_range,
+    SUM(
+      CASE
+        WHEN (
+          raw_credit = '690+'
+          AND CAST(actual_credit_score AS INT64) > 720
+        ) THEN 1
+        WHEN CAST(actual_credit_score AS INT64) BETWEEN CASE
+          self_reported_range
+          WHEN '000-639' THEN 0
+          WHEN '640-669' THEN 640
+          WHEN '670-689' THEN 670
+          WHEN '690-720' THEN 690
+          WHEN '721-800' THEN 721
+          ELSE NULL
+        END
+        AND CASE
+          self_reported_range
+          WHEN '000-639' THEN 639
+          WHEN '640-669' THEN 669
+          WHEN '670-689' THEN 689
+          WHEN '690-720' THEN 720
+          WHEN '721-800' THEN 800
+          ELSE NULL
+        END THEN 1
+        ELSE 0
+      END
+    ) AS within_range,
+    SUM(
+      CASE
+        WHEN CAST(actual_credit_score AS INT64) > (
+          CASE
+            self_reported_range
+            WHEN '000-639' THEN 639
+            WHEN '640-669' THEN 669
+            WHEN '670-689' THEN 689
+            WHEN '690-720' THEN 720
+            WHEN '721-800' THEN 800
+            ELSE NULL
+          END
+        )
+        AND NOT (
+          raw_credit = '690+'
+          AND CAST(actual_credit_score AS INT64) >= 720
+        ) THEN 1
+        ELSE 0
+      END
+    ) AS above_range,
+    SUM(
+      CASE
+        WHEN CAST(actual_credit_score AS INT64) < (
+          CASE
+            self_reported_range
+            WHEN '000-639' THEN 0
+            WHEN '640-669' THEN 640
+            WHEN '670-689' THEN 670
+            WHEN '690-720' THEN 690
+            WHEN '721-800' THEN 721
+            ELSE NULL
+          END
+        ) THEN 1
+        ELSE 0
+      END
+    ) AS below_range
+  FROM joined_data
+  GROUP BY raw_credit,
+    self_reported_credit_score,
+    actual_credit_score,
+    self_reported_range
+)
+SELECT self_reported_range,
+  SUM(within_range) AS total_within_range,
+  SUM(above_range) AS total_above_range,
+  SUM(below_range) AS total_below_range
+FROM score_accuracy
+GROUP BY self_reported_range
+ORDER BY self_reported_range
