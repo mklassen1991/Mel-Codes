@@ -1,0 +1,79 @@
+WITH app_usage AS (
+    SELECT CASE
+            WHEN EXTRACT(
+                DAYOFWEEK
+                FROM timestamp
+            ) = 1 THEN 'Sunday'
+            WHEN EXTRACT(
+                DAYOFWEEK
+                FROM timestamp
+            ) = 2 THEN 'Monday'
+            WHEN EXTRACT(
+                DAYOFWEEK
+                FROM timestamp
+            ) = 3 THEN 'Tuesday'
+            WHEN EXTRACT(
+                DAYOFWEEK
+                FROM timestamp
+            ) = 4 THEN 'Wednesday'
+            WHEN EXTRACT(
+                DAYOFWEEK
+                FROM timestamp
+            ) = 5 THEN 'Thursday'
+            WHEN EXTRACT(
+                DAYOFWEEK
+                FROM timestamp
+            ) = 6 THEN 'Friday'
+            ELSE 'Saturday'
+        END AS day_of_week,
+        CASE
+            WHEN EXTRACT(
+                HOUR
+                FROM timestamp
+            ) = 0 THEN '12:00 AM'
+            WHEN EXTRACT(
+                HOUR
+                FROM timestamp
+            ) BETWEEN 1 AND 11 THEN CONCAT(
+                EXTRACT(
+                    HOUR
+                    FROM timestamp
+                ),
+                ':00 AM'
+            )
+            WHEN EXTRACT(
+                HOUR
+                FROM timestamp
+            ) = 12 THEN '12:00 PM'
+            ELSE CONCAT(
+                EXTRACT(
+                    HOUR
+                    FROM timestamp
+                ) - 12,
+                ':00 PM'
+            )
+        END AS time_of_day,
+        user_id,
+        SUM(dwell) / 60 AS session_duration_minutes
+    FROM analytics.event_sessions
+    WHERE platform IN ('ios', 'ios_old', 'android', 'android_old')
+        AND EXTRACT(
+            MONTH
+            FROM timestamp
+        ) >= 09
+        AND EXTRACT(
+            YEAR
+            FROM timestamp
+        ) >= 2024
+    GROUP BY day_of_week,
+        time_of_day,
+        user_id
+)
+SELECT day_of_week,
+    time_of_day,
+    COUNT(DISTINCT user_id) AS unique_users,
+    ROUND(AVG(session_duration_minutes), 3) AS avg_session_duration_minutes,
+    FROM app_usage
+GROUP BY day_of_week,
+    time_of_day
+ORDER BY avg_session_duration_minutes DESC;
