@@ -1,0 +1,89 @@
+WITH new_loan_landing_page AS (
+  SELECT DISTINCT id,
+    feature_flags_new_loan_landing_page
+  FROM backflip_mobile_prod_web.users
+  WHERE feature_flags_new_loan_landing_page IS TRUE
+),
+flippers AS (
+  SELECT DISTINCT u.id AS user_id,
+    u.hubspot_id
+  FROM zion.user u
+    LEFT JOIN zion.loan_application la ON la.user_id = u.id
+    LEFT JOIN zion.loan_profile lp ON u.loan_profile_id = lp.id
+    LEFT JOIN hubspot.contacts c ON u.hubspot_id = c.id
+  WHERE la.flips_completed > 0
+    OR lp.properties_flipped IN ('1-2', '1', '10+', '2-4', '5-9', '3-9')
+    OR c.properties_flip_value IN (
+      '1',
+      '10',
+      '10+',
+      '2',
+      '3',
+      '4',
+      '5',
+      '6',
+      '7',
+      '8',
+      '9'
+    )
+),
+closed_loans AS (
+  SELECT hd.id AS deal_id,
+    hd.hs_is_closed_won,
+    DATE(TIMESTAMP_MILLIS(CAST(hd.createdate AS INT64))) AS createdate,
+    DATE(TIMESTAMP_MILLIS(CAST(hd.closedate AS INT64))) AS closedate,
+    hd.associated_vids,
+    hd.loan_status,
+    hd.dealstage,
+    hc.id AS contact_id,
+    CASE
+      WHEN hd.dealstage IN (
+        'qualifiedtobuy',
+        'presentationscheduled',
+        'closedwon',
+        '21176680',
+        '4447566',
+        '4447567',
+        '21950854'
+      ) THEN 1
+      ELSE 0
+    END AS has_loan_app_submitted,
+    CASE
+      WHEN CAST(hd.hs_is_closed_won AS BOOL) = TRUE
+      AND hd.dealname IS NOT NULL
+      AND hd.closedate IS NOT NULL
+      AND hd.dealstage <> '65967921' THEN 1
+      ELSE 0
+    END AS has_closed_loan
+  FROM hubspot.deals_view hd
+    JOIN hubspot.contacts_view hc ON hc.id IN UNNEST(SPLIT(hd.associated_vids, ','))
+),
+user_metrics AS (
+  SELECT lp.id,
+    CASE
+      WHEN f.user_id IS NOT NULL THEN 1
+      ELSE 0
+    END AS is_flipper,
+    CASE
+      WHEN cl.has_loan_app_submitted > 0 THEN 1
+      ELSE 0
+    END AS has_loan_application,
+    CASE
+      WHEN cl.has_closed_loan > 0 THEN 1
+      ELSE 0
+    END AS has_closed_loan
+  FROM new_loan_landing_page lp
+    LEFT JOIN flippers f ON lp.id = f.user_id
+    LEFT JOIN closed_loans cl ON cl.contact_id = f.hubspot_id
+)
+SELECT COUNT(DISTINCT id) AS total_users,
+  ROUND(100.0 * SUM(is_flipper) / COUNT(DISTINCT id), 2) AS pct_flippers,
+  ROUND(
+    100.0 * SUM(has_loan_application) / COUNT(DISTINCT id),
+    2
+  ) AS pct_with_loan_app,
+  ROUND(
+    100.0 * SUM(has_closed_loan) / COUNT(DISTINCT id),
+    2
+  ) AS pct_with_closed_loan
+FROM user_metrics
