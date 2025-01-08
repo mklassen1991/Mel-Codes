@@ -1,0 +1,72 @@
+WITH first_closed_box_users AS (
+    SELECT DISTINCT hubspot_id,
+        first_name,
+        last_name,
+        email
+    FROM hubspot.first_closed_box
+    WHERE email NOT LIKE '%backflip%'
+        AND box_sent_flag = 'Y'
+),
+user_id_mapping AS (
+    SELECT DISTINCT hc.id AS hubspot_id,
+        hc.email,
+        hc.properties_firstname_value AS first_name,
+        hc.properties_lastname_value AS last_name,
+        -- Priority 1: Direct hubspot_id match -- find possible id for null u.id's
+        FIRST_VALUE(u.id) OVER (
+            PARTITION BY hc.id
+            ORDER BY CASE
+                    WHEN u.id IS NOT NULL THEN 0
+                    ELSE 1
+                END,
+                u.id
+        ) AS hubspot_matched_id,
+        -- Priority 2: Email match
+        FIRST_VALUE(u2.id) OVER (
+            PARTITION BY hc.email
+            ORDER BY CASE
+                    WHEN u2.id IS NOT NULL THEN 0
+                    ELSE 1
+                END,
+                u2.id
+        ) AS email_matched_id,
+        -- Priority 3: Name match
+        FIRST_VALUE(u3.id) OVER (
+            PARTITION BY hc.properties_firstname_value,
+            hc.properties_lastname_value
+            ORDER BY CASE
+                    WHEN u3.id IS NOT NULL THEN 0
+                    ELSE 1
+                END,
+                CASE
+                    WHEN hc.email = u3.email THEN 0
+                    WHEN hc.email LIKE '%' || u3.email || '%'
+                    OR u3.email LIKE '%' || hc.email || '%' THEN 1
+                    ELSE 2
+                END,
+                u3.id
+        ) AS name_matched_id
+    FROM hubspot.contacts hc
+        INNER JOIN first_closed_box_users fcbu ON fcbu.hubspot_id = hc.id
+        LEFT JOIN zion.user u ON u.hubspot_id = hc.id
+        LEFT JOIN zion.user u2 ON u2.email = hc.email
+        LEFT JOIN zion.user u3 ON u3.first_name = hc.properties_firstname_value
+        AND u3.last_name = hc.properties_lastname_value
+),
+first_closed_box AS (
+    SELECT fcb.hubspot_id,
+        COALESCE(
+            MIN(u.id),
+            MIN(uim.hubspot_matched_id),
+            MIN(uim.email_matched_id),
+            MIN(uim.name_matched_id)
+        ) AS id,
+        fcb.first_name,
+        fcb.last_name,
+        fcb.email,
+        fcb.box_sent_flag,
+        fcb.box_sent_date
+    FROM hubspot.first_closed_box fcb
+        LEFT JOIN hubspot.contacts hc ON fcb.first_name = hc.properties_firstname_value
+        AND fcb.last_name = hc.properties_lastname_value
+        AND fcb.email = hc.email
