@@ -1,0 +1,109 @@
+import altair as alt
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+from bigquery import query
+
+
+@st.cache_data(ttl=60 * 60 * 24)
+def load_data(
+    create_date: str,
+    create_date_end: str,
+    utm_source: str = None,
+    tier: str = None,
+) -> pd.DataFrame:
+    query_config = [
+        {
+            "name": "create_date",
+            "type_": "STRING",
+            "value": create_date,
+        },
+        {
+            "name": "create_date_end",
+            "type_": "STRING",
+            "value": create_date_end,
+        },
+    ]
+    # Query all data without utm_source filter
+    df = query(
+        "new_members_dashboard.sql",
+        config=query_config,
+    )
+
+    # Filter the DataFrame based on utm_source if specified
+    if utm_source:
+        df = df[df["utm_source"] == utm_source]
+
+    # TIER FILTER:
+    if tier:
+        if tier == "Tier 1":
+            df = df[df["sum_tier_1"] > 0]
+        elif tier == "Tier 2":
+            df = df[df["sum_tier_2"] > 0]
+        elif tier == "Tier 3":
+            df = df[df["sum_tier_3"] > 0]
+
+    return df
+
+
+with st.sidebar:
+    # Calculate default dates
+    today = pd.to_datetime("today")
+    three_months_ago = today - pd.DateOffset(months=3)
+
+    create_date = st.date_input("Create Date", value=three_months_ago, max_value=today)
+    create_date_end = st.date_input("Create Date End", value=today, max_value=today)
+
+    # Load initial data to get unique utm_source values
+    initial_df = load_data(
+        create_date.strftime("%Y-%m-%d"),
+        create_date_end.strftime("%Y-%m-%d"),
+    )
+
+    utm_source_options = [None, *list(initial_df["utm_source"].unique())]
+    utm_source_filter = st.selectbox("utm_source Filter", utm_source_options)
+
+    # Add Tier filter
+    tier_options = [None, "Tier 1", "Tier 2", "Tier 3"]
+    tier_filter = st.selectbox("Tier Filter", tier_options)
+
+# Load data outside the sidebar
+raw_df = load_data(
+    create_date.strftime("%Y-%m-%d"), create_date_end.strftime("%Y-%m-%d"), utm_source_filter, tier_filter
+)
+
+# ADD COLUMNS --> group and aggregate data
+df_subset = (
+    raw_df.groupby("utm_content")
+    .agg(
+        total_new_members=("total_new_members", "sum"),
+        new_member_flippers=("new_member_flippers", "sum"),
+        tier_1_3_new_apps=("tier_1_3_new_apps", "sum"),
+        credit_640_applications=("credit_640_applications", "sum"),
+        total_applications=("total_applications", "sum"),
+    )
+    .assign(
+        flipper_rate=lambda x: x["new_member_flippers"] / x["total_new_members"] * 100,
+        percent_tier_1_3=lambda x: x["tier_1_3_new_apps"] / x["total_applications"] * 100,
+        percent_credit_640_applications=lambda x: x["credit_640_applications"] / x["total_applications"] * 100,
+    )
+    .reset_index()
+)
+
+# Sort by total new members and get top 25
+df_subset = df_subset.sort_values("total_new_members", ascending=False)
+top_25_df = df_subset.nlargest(25, "total_new_members")
+
+# Calculate normalized member counts
+for idx, row in top_25_df.iterrows():
+    total = row["total_new_members"]
+
+    def safe_divide(a, b):
+        return 0 if b == 0 else a / b
+
+    proportions = pd.Series(
+        [
+            safe_divide(row["credit_640_applications"], row["total_applications"]),
+            safe_divide(row["new_member_flippers"], row["total_new_members"]),
+            safe_divide(row["tier_1_3_new_apps"], row["total_applications"]),
