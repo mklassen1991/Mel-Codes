@@ -1,0 +1,178 @@
+WITH surprise_delight_users AS (
+    SELECT DISTINCT contact_id,
+        u.id,
+        sd.first_name,
+        sd.last_name,
+        surprise_delight_sent,
+        EXTRACT(
+            year
+            FROM added_at
+        ) AS cohort_year,
+        EXTRACT(
+            week
+            FROM added_at
+        ) AS cohort_week,
+        EXTRACT(
+            quarter
+            FROM added_at
+        ) AS cohort_quarter
+    FROM hubspot.surprise_delight sd
+        LEFT JOIN hubspot.contacts hc ON sd.contact_id = hc.id
+        LEFT JOIN zion.user u ON u.hubspot_id = hc.id
+),
+app_behavior AS (
+    SELECT EXTRACT(
+            year
+            FROM start_date
+        ) AS cohort_year,
+        EXTRACT(
+            week
+            FROM start_date
+        ) AS cohort_week,
+        EXTRACT(
+            quarter
+            FROM start_date
+        ) AS cohort_quarter,
+        user_id,
+        SUM(analyses_run) AS analyses_run,
+        SUM(loan_applications_created) AS loan_applications_started,
+        SUM(loan_applications_submitted) AS loan_applications_submitted,
+        SUM(loan_applications_closed) AS loan_applications_closed,
+        SUM(screens_viewed) AS screens_viewed,
+        CASE
+            WHEN surprise_delight_sent IS NOT NULL THEN 1
+            ELSE 0
+        END AS surprise_delight_flag
+    FROM analytics.user_day ud
+        LEFT JOIN surprise_delight_users sd ON ud.user_id = sd.id
+    GROUP BY cohort_year,
+        cohort_week,
+        cohort_quarter,
+        user_id,
+        surprise_delight_sent
+),
+cohort_user_counts AS(
+    SELECT cohort_year,
+        cohort_week,
+        surprise_delight_flag,
+        COUNT(DISTINCT user_id) AS user_count
+    FROM app_behavior
+    GROUP BY cohort_year,
+        cohort_week,
+        surprise_delight_flag
+)
+SELECT ab.cohort_year,
+    ab.cohort_week,
+    ab.cohort_quarter,
+    CONCAT(ab.cohort_year, '-', ab.cohort_week) AS cohort,
+    ROUND(
+        AVG(
+            CASE
+                WHEN ab.surprise_delight_flag = 0 THEN ab.analyses_run
+                ELSE NULL
+            END
+        ),
+        3
+    ) AS avg_analyses_run_rest,
+    ROUND(
+        AVG(
+            CASE
+                WHEN ab.surprise_delight_flag = 1 THEN COALESCE(ab.analyses_run, 0)
+                ELSE NULL
+            END
+        ),
+        3
+    ) AS avg_analyses_run_sd,
+    ROUND(
+        AVG(
+            CASE
+                WHEN ab.surprise_delight_flag = 0 THEN ab.loan_applications_started
+                ELSE NULL
+            END
+        ),
+        3
+    ) AS avg_loan_apps_started_rest,
+    ROUND(
+        AVG(
+            CASE
+                WHEN ab.surprise_delight_flag = 1 THEN COALESCE(ab.loan_applications_started, 0)
+                ELSE NULL
+            END
+        ),
+        3
+    ) AS avg_loan_apps_started_sd,
+    ROUND(
+        AVG(
+            CASE
+                WHEN ab.surprise_delight_flag = 0 THEN ab.loan_applications_submitted
+                ELSE NULL
+            END
+        ),
+        3
+    ) AS avg_loan_apps_submitted_rest,
+    ROUND(
+        AVG(
+            CASE
+                WHEN ab.surprise_delight_flag = 1 THEN COALESCE(ab.loan_applications_submitted, 0)
+                ELSE NULL
+            END
+        ),
+        3
+    ) AS avg_loan_apps_submitted_sd,
+    ROUND(
+        AVG(
+            CASE
+                WHEN ab.surprise_delight_flag = 0 THEN ab.loan_applications_closed
+                ELSE NULL
+            END
+        ),
+        3
+    ) AS avg_loan_apps_closed_rest,
+    ROUND(
+        AVG(
+            CASE
+                WHEN ab.surprise_delight_flag = 1 THEN COALESCE(ab.loan_applications_closed, 0)
+                ELSE NULL
+            END
+        ),
+        3
+    ) AS avg_loan_apps_closed_sd,
+    ROUND(
+        AVG(
+            CASE
+                WHEN ab.surprise_delight_flag = 0 THEN ab.screens_viewed
+                ELSE NULL
+            END
+        ),
+        3
+    ) AS avg_screens_viewed_rest,
+    ROUND(
+        AVG(
+            CASE
+                WHEN ab.surprise_delight_flag = 1 THEN COALESCE(ab.screens_viewed, 0)
+                ELSE NULL
+            END
+        ),
+        3
+    ) AS avg_screens_viewed_sd
+FROM app_behavior ab
+    JOIN cohort_user_counts cuc ON ab.cohort_year = cuc.cohort_year
+    AND ab.cohort_week = cuc.cohort_week
+    AND ab.surprise_delight_flag = cuc.surprise_delight_flag
+GROUP BY ab.cohort_year,
+    ab.cohort_week,
+    ab.cohort_quarter
+HAVING COUNT(
+        DISTINCT CASE
+            WHEN ab.surprise_delight_flag = 0 THEN 1
+            ELSE NULL
+        END
+    ) > 0
+    AND COUNT(
+        DISTINCT CASE
+            WHEN ab.surprise_delight_flag = 1 THEN 1
+            ELSE NULL
+        END
+    ) > 0
+ORDER BY cohort_year DESC,
+    cohort_week DESC
