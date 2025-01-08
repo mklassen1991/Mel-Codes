@@ -1,0 +1,174 @@
+WITH all_deals AS (
+  SELECT hd.id AS deal_id,
+    hd.hs_is_closed_won,
+    DATE(TIMESTAMP_MILLIS(CAST(hd.createdate AS INT64))) AS createdate,
+    DATE(TIMESTAMP_MILLIS(CAST(hd.closedate AS INT64))) AS closedate,
+    DATE(
+      TIMESTAMP_MILLIS(CAST(hd.repayment_date AS INT64))
+    ) AS repaydate,
+    COALESCE(
+      DATE(
+        TIMESTAMP_MILLIS(SAFE_CAST(hd.maturity_date_extended AS INT64))
+      ),
+      DATE(
+        TIMESTAMP_MILLIS(CAST(hd.maturity_date AS INT64))
+      )
+    ) AS combined_maturity_date,
+    hd.borrow_type,
+    hd.associated_vids,
+    hd.loan_status,
+    hd.dealstage,
+    hd.deal_tier,
+    hc.id AS contact_id
+  FROM hubspot.deals_view hd
+    JOIN hubspot.contacts_view hc ON hc.id IN UNNEST(SPLIT(hd.associated_vids, ',')) --WHERE cast(hd.hs_is_closed_won AS BOOL) = TRUE
+    AND hd.dealname IS NOT NULL -- AND hd.closedate IS NOT NULL
+    AND hd.dealstage <> '65967921'
+),
+closed_loan AS (
+  SELECT deal_id,
+    contact_id,
+    hs_is_closed_won,
+    createdate,
+    closedate,
+    repaydate,
+    combined_maturity_date,
+    deal_tier,
+    dealstage,
+    loan_status
+  FROM all_deals
+  WHERE dealstage IN (
+      'closedwon',
+      '21176680',
+      '4447566',
+      '4447567'
+    )
+    AND cast(hs_is_closed_won AS BOOL) = TRUE
+    AND closedate IS NOT NULL
+),
+following_loan AS (
+  SELECT cl.contact_id,
+    cl.deal_id,
+    cl.createdate,
+    cl.closedate,
+    cl.repaydate,
+    cl.dealstage,
+    cl.deal_tier,
+    cl.loan_status,
+    MIN(
+      DATE(
+        TIMESTAMP_MILLIS(CAST(next_loan.createdate AS INT64))
+      )
+    ) AS next_loan_createdate
+  FROM closed_loan cl
+    JOIN hubspot.deals_view next_loan ON cl.contact_id IN UNNEST(SPLIT(next_loan.associated_vids, ','))
+    AND DATE(
+      TIMESTAMP_MILLIS(CAST(next_loan.createdate AS INT64))
+    ) > cl.createdate
+  WHERE next_loan.dealstage IN (
+      'qualifiedtobuy',
+      '119976743',
+      'presentationscheduled',
+      'closedwon',
+      '21176680',
+      '4447566',
+      '4447567'
+    )
+  GROUP BY cl.contact_id,
+    cl.deal_id,
+    cl.createdate,
+    cl.closedate,
+    cl.repaydate,
+    cl.dealstage,
+    cl.deal_tier,
+    cl.loan_status
+  ORDER BY cl.contact_id,
+    cl.closedate
+),
+combined_data AS (
+  SELECT concat(
+      extract(
+        year
+        FROM COALESCE(cl.closedate, ad.createdate)
+      ),
+      '-',
+      lpad(
+        cast(
+          extract(
+            MONTH
+            FROM COALESCE(cl.closedate, ad.createdate)
+          ) AS STRING
+        ),
+        2,
+        '0'
+      )
+    ) AS cohort,
+    CASE
+      WHEN ad.deal_tier = 'Tier 1 - Great Deal' THEN 1
+      WHEN ad.deal_tier = 'Tier 2 - Good Deal' THEN 2
+      WHEN ad.deal_tier = 'Tier 3 - OK Deal' THEN 3
+      WHEN ad.deal_tier IN ('Tier 4 - Not lendable', 'tier_5__not_lendable') THEN 4
+    END AS Tier,
+    COUNT(DISTINCT ad.deal_id) AS total_deals,
+    COUNT(DISTINCT cl.deal_id) AS total_closed_loans,
+    COUNT(
+      DISTINCT (
+        CASE
+          WHEN cl.loan_status = 'Repaid - In Full' THEN cl.deal_id
+        END
+      )
+    ) AS total_repaid,
+    COUNT(
+      DISTINCT (
+        CASE
+          WHEN CURRENT_DATE() > cl.combined_maturity_date
+          AND cl.loan_status != 'Repaid - In Full' THEN cl.deal_id
+        END
+      )
+    ) AS unpaid_past_due,
+    COUNT(
+      DISTINCT (
+        CASE
+          WHEN CURRENT_DATE() <= cl.combined_maturity_date
+          AND cl.loan_status != 'Repaid - In Full' THEN cl.deal_id
+        END
+      )
+    ) AS unpaid_not_past_due,
+    COUNT(
+      DISTINCT (
+        CASE
+          WHEN cl.dealstage = '21950854' THEN cl.deal_id
+        END
+      )
+    ) AS brokered_legacy,
+    COUNT(
+      DISTINCT (
+        CASE
+          WHEN cl.loan_status = 'Repaid - In Full' THEN fl.deal_id
+        END
+      )
+    ) AS repeat
+  FROM all_deals ad
+    FULL JOIN closed_loan cl ON ad.deal_id = cl.deal_id
+    LEFT JOIN following_loan fl ON cl.deal_id = fl.deal_id
+  GROUP BY cohort,
+    ad.deal_tier
+  ORDER BY cohort,
+    ad.deal_tier
+)
+SELECT cohort,
+  tier,
+  total_deals,
+  total_closed_loans,
+  total_repaid,
+  unpaid_past_due,
+  unpaid_not_past_due,
+  brokered_legacy,
+  repeat,
+  ROUND((total_closed_loans / total_deals), 2) AS loan_application_conversion,
+  ROUND((total_repaid / total_deals), 2) AS repaid_conversion,
+  ROUND((unpaid_past_due / total_deals), 2) AS unpaid_past_due_conversion,
+  ROUND((unpaid_not_past_due / total_deals), 2) AS unpaid_not_past_due_conversion,
+  ROUND((brokered_legacy / total_deals), 2) AS brokered_legacy_conversion,
+  ROUND((repeat / total_deals), 2) AS repeat_conversion
+FROM combined_data;
