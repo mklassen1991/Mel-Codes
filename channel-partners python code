@@ -1,0 +1,68 @@
+import pandas as pd
+import streamlit as st
+
+from bigquery import query
+
+
+@st.cache_data(ttl=60 * 60 * 24)
+def load_data() -> pd.DataFrame:
+    return query(
+        "channel_partners.sql",
+    )
+
+
+def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
+    with st.sidebar:
+        st.subheader("Filters")
+
+        # Date joined year filter
+        if "date_joined" in df.columns:
+            df["date_joined_year"] = pd.to_datetime(df["date_joined"]).dt.year
+            df["date_joined_quarter"] = pd.to_datetime(df["date_joined"]).dt.quarter
+
+            st.markdown("#### Time Filters")
+            # Create year filter
+            available_years = sorted(df["date_joined_year"].unique())
+            selected_years = st.multiselect("Filter by Year Joined", options=available_years, default=available_years)
+            if selected_years:
+                df = df[df["date_joined_year"].isin(selected_years)]
+
+            # Create quarter filter
+            available_quarters = sorted(df["date_joined_quarter"].unique())
+            selected_quarters = st.multiselect(
+                "Filter by Quarter Joined",
+                options=available_quarters,
+                default=available_quarters,
+                format_func=lambda x: f"Q{x}",
+            )
+            if selected_quarters:
+                df = df[df["date_joined_quarter"].isin(selected_quarters)]
+
+        # Has closed loan filter
+        if "has_closed_loan" in df.columns:
+            st.markdown("#### Loan Status")
+            has_closed_loan = st.radio(
+                "Filter by Loan Status", options=["All", "Has Closed Loan", "No Closed Loan"], horizontal=True
+            )
+
+            if has_closed_loan != "All":
+                filter_value = has_closed_loan == "Has Closed Loan"
+                df = df[df["has_closed_loan"] == filter_value]
+
+    return df
+
+
+# Load data
+raw_df = load_data()
+
+# Apply filters and get filtered dataframe
+filtered_df = apply_filters(raw_df)
+
+# Display data
+st.subheader("Channel Partner Referrals")
+st.dataframe(filtered_df)
+
+# Display summary metrics
+st.subheader("Summary")
+total_records = len(filtered_df)
+st.metric("Total Records", total_records)
