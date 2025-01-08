@@ -1,0 +1,42 @@
+WITH user_group AS (
+    SELECT EXTRACT(
+            WEEK
+            FROM timestamp
+        ) AS week,
+        EXTRACT(
+            YEAR
+            FROM timestamp
+        ) AS year,
+        CASE
+            WHEN platform IN ('ios', 'ios_old', 'android', 'android_old') THEN 'app'
+            WHEN platform IN ('web', 'mobile_web') THEN 'web'
+            ELSE platform
+        END AS platform,
+        user_id,
+        SUM(dwell) / 60 AS session_duration_min
+    FROM analytics.event_sessions
+    WHERE EXTRACT(
+            MONTH
+            FROM timestamp
+        ) >= 09
+        AND EXTRACT(
+            YEAR
+            FROM timestamp
+        ) >= 2024
+    GROUP BY week,
+        year,
+        platform,
+        user_id
+)
+SELECT week,
+    year,
+    platform,
+    COUNT(DISTINCT user_id) AS unique_users,
+    ROUND(AVG(session_duration_min), 3) AS avg_session_duration_min,
+    FROM user_group
+GROUP BY week,
+    year,
+    platform
+ORDER BY week DESC,
+    year DESC,
+    platform
