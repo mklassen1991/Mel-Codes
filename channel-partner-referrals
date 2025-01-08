@@ -1,0 +1,68 @@
+WITH referred_members AS (
+  SELECT DISTINCT u.referred_by_user_id,
+    u.id AS member_user_id,
+    u.hubspot_id,
+    u.first_name,
+    u.last_name,
+    u.date_joined,
+    EXTRACT(
+      year
+      FROM CAST(u.date_joined AS TIMESTAMP)
+    ) AS date_joined_year,
+    EXTRACT(
+      quarter
+      FROM CAST(u.date_joined AS TIMESTAMP)
+    ) AS date_joined_quarter,
+    CONCAT(ref.first_name, ' ', ref.last_name) AS channel_partner_name,
+    ins.utm_campaign,
+    ins.utm_source
+  FROM zion.user u
+    LEFT JOIN zion.user ref ON u.referred_by_user_id = ref.id
+    LEFT JOIN analytics.inbound_source ins ON ins.hubspot_id = u.hubspot_id
+  WHERE ref.is_channel_partner = TRUE
+    OR ins.utm_source = 'channelpartner'
+  ORDER BY date_joined_year DESC,
+    date_joined_quarter DESC
+),
+closed_loans AS (
+  SELECT DISTINCT hd.id AS deal_id,
+    COALESCE(hc.id, u.hubspot_id) AS id,
+    DATE(TIMESTAMP_MILLIS(CAST(hd.createdate AS INT64))) AS createdate,
+    DATE(TIMESTAMP_MILLIS(CAST(hd.closedate AS INT64))) AS closedate,
+    CONCAT(
+      properties_firstname_value,
+      ' ',
+      properties_lastname_value
+    ) AS borrower_name,
+    hc.email,
+    properties_attribution_value,
+    attribution_channel
+  FROM hubspot.deals_view hd
+    JOIN hubspot.contacts_view hc ON hc.id IN UNNEST(SPLIT(hd.associated_vids, ','))
+    LEFT JOIN zion.user u ON u.hubspot_id = hc.id
+  WHERE cast(hd.hs_is_closed_won AS BOOL) = TRUE
+    AND hd.dealname IS NOT NULL
+    AND hd.closedate IS NOT NULL
+    AND hd.dealstage <> '65967921'
+  ORDER BY closedate DESC
+)
+SELECT rm.first_name,
+  rm.last_name,
+  rm.hubspot_id,
+  rm.date_joined,
+  rm.date_joined_year,
+  rm.date_joined_quarter,
+  rm.channel_partner_name,
+  rm.utm_campaign,
+  rm.utm_source,
+  CASE
+    WHEN cl.deal_id IS NOT NULL THEN TRUE
+    ELSE FALSE
+  END AS has_closed_loan,
+  cl.closedate,
+  cl.borrower_name,
+  cl.email
+FROM referred_members rm
+  LEFT JOIN closed_loans cl ON cl.id = rm.hubspot_id
+ORDER BY rm.date_joined_year DESC,
+  rm.date_joined_quarter DESC;
